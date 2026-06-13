@@ -217,6 +217,20 @@ def is_dangerous_pattern(command: str) -> bool:
 
 def sanitize_command(cmd_str: str) -> List[str]:
     """Tokenize, expand braces, and block unsafe operators and patterns."""
+    # Block heredocs and multi-line commands early
+    if "\n" in cmd_str:
+        raise ValueError(
+            "Multi-line commands are not supported. "
+            "If you are trying to write a multi-line file, use the 'write_file' tool from the file server (mcp-fs). "
+            "For heredocs (<<), they are not supported. Use 'write_file' instead."
+        )
+    if "<<" in cmd_str:
+        raise ValueError(
+            "Heredoc syntax (<<) is not supported. "
+            "To create a file with content, use the 'write_file' tool from the file server (mcp-fs). "
+            "Example: call write_file with path and content."
+        )
+
     if is_dangerous_pattern(cmd_str):
         raise ValueError("Command contains dangerous pattern (wildcard, substitution, or backticks).")
 
@@ -530,7 +544,15 @@ mcp = FastMCP("mcp-sh")
 
 @mcp.tool()
 async def shell_exec(command: str, session_id: Optional[str] = None, stream: bool = False, ctx: Context = None) -> str:
-    """Execute a shell command inside the sandbox. Use session_id to persist cd state between calls."""
+    """
+    Execute a single-line shell command inside the sandbox. Use session_id to persist cd state between calls.
+
+    IMPORTANT LIMITATIONS:
+    - Heredocs (<<) are NOT supported. For multi-line file creation, use the 'write_file' tool from the file server.
+    - Multi-line commands are NOT accepted. Use ';' or '&&' for chaining on a single line.
+    - Pipes (|) and wildcards (*, ?) are blocked for security.
+    - Only a safe subset of commands is allowed (see shell_info).
+    """
     cmd_str = command.strip()
     if not cmd_str:
         return "❌ Empty command."
@@ -573,7 +595,8 @@ async def shell_info() -> str:
         f"⏱️ Timeout: {COMMAND_TIMEOUT}s\n"
         f"📏 Max output: {MAX_OUTPUT_SIZE} chars\n"
         f"🔒 Safe env vars: {', '.join(sorted(SAFE_ENV_VARS))}\n"
-        f"💾 Active sessions: {len(_sessions)}"
+        f"💾 Active sessions: {len(_sessions)}\n"
+        f"⚠️ Heredocs (<<) and multi-line commands are NOT supported. Use 'write_file' from the file server instead."
     )
 
 
