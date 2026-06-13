@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Secure MCP Shell Server – State-of-the-art sandboxed shell access for MCP.
+Secure MCP Shell Server - State-of-the-art sandboxed shell access for MCP.
 """
 
 import sys
@@ -10,6 +10,7 @@ import asyncio
 import argparse
 import logging
 import base64
+import re
 from pathlib import Path
 from typing import Any, Optional, List, Tuple, Dict, Set
 
@@ -95,8 +96,9 @@ ALLOWED_COMMANDS: Set[str] = set()
 DENIED_COMMANDS: Set[str] = set()
 COMMAND_TIMEOUT: int = 30
 MAX_OUTPUT_SIZE: int = 100_000
-ALLOW_REDIRECT: bool = False
-ALLOW_CHAINING: bool = False
+ALLOW_REDIRECT: bool = True
+ALLOW_CHAINING: bool = True
+ALLOW_BRACE_EXPANSION: bool = True
 VERBOSE: bool = False
 
 # Session management: maps session_id -> absolute path (inside sandbox) of virtual cwd
@@ -110,6 +112,87 @@ if VERBOSE:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s [%(levelname)s] %(message)s")
 else:
     logger.addHandler(logging.NullHandler())
+
+
+# ----------------------------------------------------------------------
+# Brace expansion (safe, does not execute anything)
+# ----------------------------------------------------------------------
+def expand_brace_pattern(token: str) -> List[str]:
+    """
+    Expand a brace pattern in a single token.
+    Example: 'a{b,c}d' -> ['abd', 'acd']
+    Supports nested braces and escaped characters.
+    """
+    # Find the first unescaped '{' that has a matching '}'
+    stack = []
+    start = -1
+    i = 0
+    n = len(token)
+    while i < n:
+        ch = token[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "{":
+            if not stack:
+                start = i
+            stack.append(i)
+        elif ch == "}":
+            if stack:
+                stack.pop()
+                if not stack:
+                    # complete brace group from start to i
+                    prefix = token[:start]
+                    suffix = token[i + 1 :]
+                    inner = token[start + 1 : i]
+                    # split inner by commas at top level (respect nested braces)
+                    choices = []
+                    depth = 0
+                    j = 0
+                    last = 0
+                    inner_len = len(inner)
+                    while j < inner_len:
+                        c = inner[j]
+                        if c == "{":
+                            depth += 1
+                        elif c == "}":
+                            depth -= 1
+                        elif c == "," and depth == 0:
+                            choices.append(inner[last:j])
+                            last = j + 1
+                        j += 1
+                    choices.append(inner[last:])
+                    # recursively expand each choice
+                    expanded_choices = []
+                    for choice in choices:
+                        sub_exp = expand_brace_pattern(choice)
+                        expanded_choices.extend(sub_exp)
+                    # combine prefix + each choice + suffix
+                    results = []
+                    for choice in expanded_choices:
+                        results.append(prefix + choice + suffix)
+                    return results
+        i += 1
+    # No braces found, return the token as a single-element list
+    return [token]
+
+
+def expand_braces_in_tokens(tokens: List[str]) -> List[str]:
+    """
+    Expand any tokens that contain brace patterns.
+    Returns a new list where each original token may be replaced by multiple tokens.
+    """
+    if not ALLOW_BRACE_EXPANSION:
+        return tokens
+    new_tokens = []
+    for t in tokens:
+        if "{" in t and "}" in t and not (t.startswith("'") or t.startswith('"')):
+            # potential brace expansion – expand it
+            expanded = expand_brace_pattern(t)
+            new_tokens.extend(expanded)
+        else:
+            new_tokens.append(t)
+    return new_tokens
 
 
 # ----------------------------------------------------------------------
@@ -133,11 +216,14 @@ def is_dangerous_pattern(command: str) -> bool:
 
 
 def sanitize_command(cmd_str: str) -> List[str]:
-    """Tokenize and block unsafe operators and patterns."""
+    """Tokenize, expand braces, and block unsafe operators and patterns."""
     if is_dangerous_pattern(cmd_str):
         raise ValueError("Command contains dangerous pattern (wildcard, substitution, or backticks).")
 
     tokens = shlex.split(cmd_str)
+    # Expand braces after tokenization but before further processing
+    tokens = expand_braces_in_tokens(tokens)
+
     for i, token in enumerate(tokens):
         if token == "|":
             raise ValueError("Pipe operator '|' is not allowed (use files or chaining instead).")
@@ -439,7 +525,7 @@ async def execute_chained_commands(
 # ----------------------------------------------------------------------
 # FastMCP server
 # ----------------------------------------------------------------------
-mcp = FastMCP("secure-shell")
+mcp = FastMCP("mcp-sh")
 
 
 @mcp.tool()
@@ -541,11 +627,11 @@ async def download_file(path: str, session_id: Optional[str] = None) -> str:
 
 
 # ----------------------------------------------------------------------
-# Main entry point
+# Main entry point (updated with --allow-brace-expansion)
 # ----------------------------------------------------------------------
 def main():
     global ALLOWED_DIR, ALLOWED_COMMANDS, DENIED_COMMANDS
-    global COMMAND_TIMEOUT, MAX_OUTPUT_SIZE, ALLOW_REDIRECT, ALLOW_CHAINING, VERBOSE
+    global COMMAND_TIMEOUT, MAX_OUTPUT_SIZE, ALLOW_REDIRECT, ALLOW_CHAINING, ALLOW_BRACE_EXPANSION, VERBOSE
 
     parser = argparse.ArgumentParser(
         description="Secure MCP Shell Server – sandboxed shell access with sessions and file tools.",
@@ -561,6 +647,9 @@ Examples:
   # Custom sandbox root
   %(prog)s --root /path/to/sandbox
 
+  # Disable brace expansion (safer but less convenient)
+  %(prog)s --no-brace-expansion
+
   # Increase timeout and output limit
   %(prog)s --timeout 60 --max-output 500000
         """,
@@ -574,6 +663,15 @@ Examples:
     parser.add_argument("--max-output", type=int, default=100_000, help="Maximum output characters per command.")
     parser.add_argument("--allow-redirect", action="store_true", help="Allow > and >> redirection operators.")
     parser.add_argument("--allow-chaining", action="store_true", help="Allow &&, ||, ; chaining operators.")
+    parser.add_argument(
+        "--allow-brace-expansion",
+        action="store_true",
+        default=True,
+        help="Enable safe brace expansion (e.g., mkdir {a,b,c}) [default: True]",
+    )
+    parser.add_argument(
+        "--no-brace-expansion", dest="allow_brace_expansion", action="store_false", help="Disable brace expansion"
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging to stderr.")
 
     args = parser.parse_args()
@@ -597,6 +695,7 @@ Examples:
     MAX_OUTPUT_SIZE = args.max_output
     ALLOW_REDIRECT = args.allow_redirect
     ALLOW_CHAINING = args.allow_chaining
+    ALLOW_BRACE_EXPANSION = args.allow_brace_expansion
     VERBOSE = args.verbose
 
     if VERBOSE:
@@ -604,7 +703,7 @@ Examples:
         logger.info("Secure Shell Server starting")
         logger.info(f"Sandbox root: {ALLOWED_DIR}")
         logger.info(f"Allowed commands: {len(ALLOWED_COMMANDS)}")
-        logger.info(f"Redirect: {ALLOW_REDIRECT}, Chaining: {ALLOW_CHAINING}")
+        logger.info(f"Redirect: {ALLOW_REDIRECT}, Chaining: {ALLOW_CHAINING}, Brace expansion: {ALLOW_BRACE_EXPANSION}")
 
     mcp.run()
 
