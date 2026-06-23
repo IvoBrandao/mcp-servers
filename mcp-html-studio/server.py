@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """HTML Project Studio – MCP Server (FastMCP edition)"""
 
+import argparse
 import asyncio
 import json
 import os
 import shutil
+import sys
 import tempfile
 import zipfile
 import mimetypes
@@ -23,8 +25,10 @@ from mcp.server.fastmcp import FastMCP, Context
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
+# Sandbox root. All projects live somewhere inside this directory. The model
+# chooses *where* (the project name may be a nested path like "clients/acme"),
+# but nothing is ever created or read outside this root. Set via --root in main().
 ALLOWED_DIR: Path = Path.cwd().resolve() / "projects"
-ALLOWED_DIR.mkdir(parents=True, exist_ok=True)
 PREVIEW_PORT_START = 8080
 PREVIEW_PORT_END = 8090
 
@@ -37,11 +41,42 @@ _active_servers: Dict[str, Any] = {}
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+def is_within_sandbox(p: Path) -> bool:
+    """True if `p` is ALLOWED_DIR itself or a path nested inside it.
+
+    Uses path-component comparison rather than string prefix matching, so a
+    sibling like `/root/projects-evil` is not treated as inside `/root/projects`.
+    """
+    return p == ALLOWED_DIR or ALLOWED_DIR in p.parents
+
+
+def safe_join(base: Path, rel: str) -> Path:
+    """Resolve `rel` under `base`, rejecting anything that escapes `base`.
+
+    `rel` is always treated as relative (a leading `/` is stripped), so an
+    absolute-looking path can't replace the base. Traversal via `..` is caught
+    by the post-resolution containment check.
+    """
+    cleaned = (rel or "").strip().lstrip("/")
+    if not cleaned:
+        raise ValueError("Empty path")
+    full = (base / cleaned).resolve()
+    if full != base and base not in full.parents:
+        raise ValueError(f"Path '{rel}' escapes '{base.name}'")
+    return full
+
+
 def get_project_path(project_name: str) -> Path:
-    safe_name = "".join(c for c in project_name if c.isalnum() or c in "_-")
-    if not safe_name:
-        raise ValueError("Invalid project name")
-    return (ALLOWED_DIR / safe_name).resolve()
+    """Resolve a model-specified project location, confined to the sandbox.
+
+    The name may be a nested path (e.g. "clients/acme/site"); it is always
+    interpreted relative to the sandbox root and may never resolve to the root
+    itself or anywhere outside it.
+    """
+    full = safe_join(ALLOWED_DIR, project_name)
+    if full == ALLOWED_DIR:
+        raise ValueError("Project name must not be empty or the sandbox root")
+    return full
 
 
 def ensure_project(project_name: str) -> Path:
@@ -57,7 +92,14 @@ def ensure_project(project_name: str) -> Path:
 
 
 def get_all_projects() -> List[str]:
-    return [d.name for d in ALLOWED_DIR.iterdir() if d.is_dir()]
+    """List projects (directories containing an index.html), as paths relative
+    to the sandbox root so nested locations are visible."""
+    projects = {
+        index.parent.relative_to(ALLOWED_DIR).as_posix()
+        for index in ALLOWED_DIR.rglob("index.html")
+        if index.parent != ALLOWED_DIR
+    }
+    return sorted(projects)
 
 
 async def _find_free_port() -> int:
@@ -89,7 +131,10 @@ async def start_preview_server(project_name: str) -> Dict[str, Any]:
 
     async def handle_static(request):
         rel = request.match_info.get("filename", "index.html") or "index.html"
-        file_path = project_path / rel
+        try:
+            file_path = safe_join(project_path, rel)
+        except ValueError:
+            return web.HTTPForbidden()
         if not file_path.exists():
             return web.HTTPNotFound()
         if file_path.is_dir():
@@ -158,10 +203,16 @@ async def create_project(
     name: str,
     template: Literal["basic", "tailwind", "react", "vue"] = "basic",
 ) -> str:
-    """Create a new HTML/CSS/JS project directory with a starter index.html."""
+    """Create a new HTML/CSS/JS project directory with a starter index.html.
+
+    `name` chooses where the project is created and may be a nested path
+    (e.g. "demos/landing-page"). The location is always confined to the
+    server's sandbox root — paths that try to escape it are rejected.
+    """
     try:
         project_path = ensure_project(name)
-        return f"✅ Project '{name}' created at {project_path}"
+        rel = project_path.relative_to(ALLOWED_DIR).as_posix()
+        return f"✅ Project '{rel}' created at {project_path}"
     except Exception as e:
         return f"❌ {e}"
 
@@ -203,9 +254,7 @@ async def edit_file(project: str, file: str, content: str) -> str:
     """Write content to a file inside a project (creates or overwrites)."""
     try:
         proj = get_project_path(project)
-        full = (proj / file).resolve()
-        if not full.as_posix().startswith(proj.as_posix()):
-            return "❌ Path traversal denied."
+        full = safe_join(proj, file)
         full.parent.mkdir(parents=True, exist_ok=True)
         async with aiofiles.open(full, "w") as f:
             await f.write(content)
@@ -219,9 +268,7 @@ async def read_file(project: str, file: str) -> str:
     """Read the content of a file inside a project."""
     try:
         proj = get_project_path(project)
-        full = (proj / file).resolve()
-        if not full.as_posix().startswith(proj.as_posix()):
-            return "❌ Path traversal denied."
+        full = safe_join(proj, file)
         if not full.exists():
             return "❌ File not found."
         async with aiofiles.open(full, "r") as f:
@@ -278,7 +325,11 @@ async def import_project(name: str, zip_base64: str) -> str:
         proj = get_project_path(name)
         if proj.exists():
             shutil.rmtree(proj)
+        proj.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(tmp_path, "r") as zf:
+            # Guard against zip-slip: confine every entry inside the project dir.
+            for member in zf.namelist():
+                safe_join(proj, member)
             zf.extractall(proj)
         os.unlink(tmp_path)
         return f"✅ Project '{name}' imported."
@@ -289,5 +340,24 @@ async def import_project(name: str, zip_base64: str) -> str:
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
-if __name__ == "__main__":
+def main():
+    global ALLOWED_DIR
+
+    parser = argparse.ArgumentParser(description="HTML Project Studio — MCP server")
+    parser.add_argument(
+        "--root",
+        default=str(Path.cwd() / "projects"),
+        help="Sandbox root directory; all projects are created and confined here "
+             "(default: ./projects)",
+    )
+    args = parser.parse_args()
+
+    ALLOWED_DIR = Path(args.root).resolve()
+    ALLOWED_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("Sandbox root: %s", ALLOWED_DIR)
+
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -5,11 +5,13 @@ Create, preview, and edit interactive HTML/CSS/JS projects directly from your AI
 ## Features
 
 - **Create projects** from scratch with a single tool call
+- **Model-chosen locations** — the project name may be a nested path (e.g. `demos/landing`); files are created exactly where the model asks
+- **Sandboxed** — every project lives inside a configurable `--root`; nothing is ever created or read outside it
 - **Live preview** with hot-reload via WebSocket (files watched with `watchfiles`)
 - **Edit any file** — HTML, CSS, JS, or any asset
-- **Export/Import** projects as zip files (base64)
+- **Export/Import** projects as zip files (base64, with zip-slip protection)
 - **Preview server** listens only on `127.0.0.1` (never exposed externally)
-- **Path traversal protection** — files are strictly contained within the project directory
+- **Path traversal protection** — file ops and the preview server are strictly contained within the sandbox
 
 ## Installation
 
@@ -21,10 +23,20 @@ uv sync
 ## Usage
 
 ```bash
-uv run server.py
+uv run server.py --root /path/to/sandbox
 ```
 
-Projects are stored in a `projects/` subdirectory relative to the server's working directory.
+All projects are created inside the `--root` sandbox (default: `./projects`). The
+model picks the location *within* that root by passing a project name, which may
+be a nested path such as `clients/acme/site`. Names that try to escape the root
+(`../`, absolute paths) are remapped back inside it or rejected — files are never
+written or read outside the sandbox.
+
+### Command-line options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--root PATH` | `./projects` | Sandbox root directory for all projects |
 
 ## Claude Desktop Configuration
 
@@ -33,7 +45,7 @@ Projects are stored in a `projects/` subdirectory relative to the server's worki
   "mcpServers": {
     "html-studio": {
       "command": "uv",
-      "args": ["--directory", "/absolute/path/to/mcp-html-studio", "run", "server.py"]
+      "args": ["--directory", "/absolute/path/to/mcp-html-studio", "run", "server.py", "--root", "/path/to/sandbox"]
     }
   }
 }
@@ -67,8 +79,11 @@ Claude will use the tools to create the project, write the files, and give you a
 
 ## Security
 
-- All project files are contained under `projects/` inside the server's working directory.
-- Path traversal is explicitly blocked for every file operation.
+- All project files are contained under the `--root` sandbox. Project names and
+  file paths are resolved and verified to stay inside it (component-wise, so a
+  sibling like `projects-evil` is not mistaken for being inside `projects`).
+- Path traversal is blocked for every file operation, for the preview server's
+  static handler, and for zip imports (zip-slip protected).
 - Preview servers only bind to `127.0.0.1`.
 
 ## License
