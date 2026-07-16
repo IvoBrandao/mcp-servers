@@ -1,0 +1,23 @@
+[package]
+name = "mcp-html-studio"
+version = "0.1.0"
+edition = "2021"
+description = "HTML/CSS/JS project studio with live preview"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+base64 = { workspace = true }
+zip = { workspace = true }
+flate2 = { workspace = true }
+tokio-tungstenite = "0.24"
+notify = { workspace = true }
+walkdir = { workspace = true }

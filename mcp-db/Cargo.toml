@@ -1,0 +1,17 @@
+[package]
+name = "mcp-db"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite database operations for local AI data management"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+rusqlite = { workspace = true }
+base64 = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "mcp-cc"
+version = "0.1.0"
+edition = "2021"
+description = "Key-value cache with TTL and SQLite backend"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+rusqlite = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+clap = { workspace = true }

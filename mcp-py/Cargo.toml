@@ -1,0 +1,17 @@
+[package]
+name = "mcp-py"
+version = "0.1.0"
+edition = "2021"
+description = "Sandboxed Python code executor"
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+schemars = { workspace = true }
+regex = { workspace = true }
+tempfile = { workspace = true }
