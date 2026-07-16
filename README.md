@@ -102,42 +102,6 @@ The config format is the same for Claude Desktop, LM Studio, and any MCP-compati
 }
 ```
 
-### Recommended ecosystem servers
-
-Downloaded automatically on first run by `npx` / `uvx`.
-
-```json
-{
-  "mcpServers": {
-    "fetch": {
-      "command": "uvx",
-      "args": ["mcp-server-fetch", "--ignore-robots-txt"]
-    },
-    "memory": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-memory"]
-    },
-    "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "<your-token>"
-      }
-    },
-    "postgres": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://localhost/mydb"]
-    }
-  }
-}
-```
-
-> **GitHub token**: create one at github.com/settings/tokens (scopes: `repo`, `read:org`)
-
 ## Server options
 
 ### mcp-sh
