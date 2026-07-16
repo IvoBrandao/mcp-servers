@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     time::SystemTime,
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;

@@ -18,6 +18,4 @@ tower-http = { workspace = true }
 base64 = { workspace = true }
 zip = { workspace = true }
 flate2 = { workspace = true }
-tokio-tungstenite = "0.24"
-notify = { workspace = true }
 walkdir = { workspace = true }

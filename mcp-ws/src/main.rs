@@ -44,15 +44,20 @@ struct WebSearchServer {
     client: Arc<Client>,
 }
 
+// Platform-appropriate user-agent: sites sometimes serve different content
+// (or block requests) based on UA. Match the binary's actual host OS.
+#[cfg(target_os = "macos")]
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+#[cfg(not(target_os = "macos"))]
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
 impl WebSearchServer {
     fn new() -> anyhow::Result<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) \
-                 Chrome/120.0.0.0 Safari/537.36",
-            )
+            .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .context("Failed to build reqwest client")?;

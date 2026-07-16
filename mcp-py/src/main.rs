@@ -15,6 +15,15 @@ use tokio::time::timeout;
 // ---------------------------------------------------------------------------
 
 const DEFAULT_TIMEOUT_SECS: u64 = 5;
+
+// Safe PATH for executing python3. Includes Homebrew locations on macOS
+// (arm64 uses /opt/homebrew/bin; x86_64 uses /usr/local/bin) so that
+// python3 installed via Homebrew is found without inheriting the full
+// user PATH (which could contain untrusted directories).
+#[cfg(target_os = "macos")]
+const PYTHON_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+#[cfg(not(target_os = "macos"))]
+const PYTHON_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
 const MAX_OUTPUT_CHARS: usize = 50_000;
 
 /// Modules that the static validator explicitly allows (everything else
@@ -135,7 +144,7 @@ struct ExecutePythonParams {
     code: String,
     #[schemars(description = "Execution timeout in seconds (default: 5, max: 300)")]
     timeout_secs: Option<u64>,
-    #[schemars(description = "Memory limit in MB (informational; enforced via ulimit when available)")]
+    #[schemars(description = "Memory limit in MB. Enforced via ulimit on Linux; no-op on macOS (kernel does not honor RLIMIT_AS).")]
     memory_mb: Option<u64>,
 }
 
@@ -193,13 +202,21 @@ impl PythonServer {
         tracing::debug!("Executing Python code from {}", tmp_path.display());
 
         // --- Build the command ---
-        // Optionally prepend a ulimit call for memory when memory_mb is set.
-        // We use `sh -c "ulimit -v MB_IN_KB; python3 file"` so the ulimit
-        // applies only to the python process (not the wrapper sh itself).
+        // On Linux, `ulimit -v` (RLIMIT_AS) is enforced by the kernel and
+        // effectively caps virtual address space. On macOS, RLIMIT_AS is not
+        // enforced, so we skip the ulimit there to avoid a silent no-op.
         let (prog, args): (&str, Vec<String>) = if let Some(mb) = memory_mb {
-            let kb = mb.saturating_mul(1024);
+            // On Linux, ulimit -v (RLIMIT_AS) caps virtual address space and
+            // is actually enforced. On macOS the kernel ignores RLIMIT_AS, so
+            // we skip the prefix to avoid a misleading no-op.
+            let ulimit_prefix = {
+                #[cfg(target_os = "linux")]
+                { format!("ulimit -v {}; ", mb.saturating_mul(1024)) }
+                #[cfg(not(target_os = "linux"))]
+                { let _ = mb; String::new() }
+            };
             let ulimit_cmd = format!(
-                "ulimit -v {kb}; exec python3 '{path}'",
+                "{ulimit_prefix}exec python3 '{path}'",
                 path = tmp_path.display()
             );
             ("/bin/sh", vec!["-c".into(), ulimit_cmd])
@@ -212,10 +229,10 @@ impl PythonServer {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .stdin(std::process::Stdio::null())
-            // Keep the inherited environment but strip dangerous vars
-            // and fix PATH to a safe subset. Full env_clear() breaks
-            // Python on macOS because it cannot find dylibs / frameworks.
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            // Keep the inherited environment but strip dangerous vars and
+            // use a platform-aware PATH so python3 is found on all targets
+            // (including macOS arm64 Homebrew at /opt/homebrew/bin).
+            .env("PATH", PYTHON_PATH)
             .env("PYTHONDONTWRITEBYTECODE", "1")
             .env("PYTHONIOENCODING", "utf-8")
             // Strip variables that could be used to escape the sandbox
