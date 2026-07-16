@@ -6,3 +6,4 @@ target
 dist/
 .gitignore
 mcp-cc/data/*.db
+mcp_config.json
