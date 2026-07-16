@@ -1,24 +1,22 @@
-SERVERS := mcp-cc mcp-flow mcp-fs mcp-html-studio mcp-py mcp-sh mcp-think mcp-ws
+SERVERS := mcp-cc mcp-db mcp-flow mcp-fs mcp-git mcp-html-studio mcp-http mcp-py mcp-sh mcp-think mcp-ws
+DIST    := dist
 
-.PHONY: sync clean reset $(SERVERS)
+.PHONY: all build dist clean
 
-# Sync all venvs (fast — skips servers where nothing changed)
-sync:
+# Build all servers in release mode
+build:
+	cargo build --release
+
+# Build and copy binaries to dist/
+dist: build
+	@mkdir -p $(DIST)
 	@for s in $(SERVERS); do \
-		echo "→ $$s"; \
-		(cd $$s && uv sync 2>&1 | grep -v "^Resolved\|^Checked\|^Audited" || true); \
+		cp target/release/$$s $(DIST)/$$s; \
+		echo "→ $(DIST)/$$s"; \
 	done
-	@echo "Done."
+	@echo "Done. Binaries in $(DIST)/"
 
-# Remove all .venv dirs and __pycache__ trees
+# Remove dist folder and cargo build artifacts
 clean:
-	@for s in $(SERVERS); do \
-		echo "→ $$s"; \
-		rm -rf $$s/.venv; \
-		find $$s -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \
-		find $$s -name "*.pyc" -delete 2>/dev/null; \
-	done
-	@echo "Done."
-
-# Full rebuild: clean then sync
-reset: clean sync
+	rm -rf $(DIST)
+	cargo clean

@@ -2,4 +2,4 @@
 uv.lock
 context-cache/kv_store_enhanced
 target
-*.cl*
+*.cl*dist/
