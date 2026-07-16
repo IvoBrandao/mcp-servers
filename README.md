@@ -2,8 +2,6 @@
 
 A collection of local MCP (Model Context Protocol) servers for AI agents. All servers run locally — no cloud APIs required (except optional integrations).
 
-Available in **Python** (current, via [uv](https://docs.astral.sh/uv/)) and **Rust** (see [`feat/rust-port`](../../tree/feat/rust-port) branch — single compiled binary, no runtime dependency).
-
 ## Servers
 
 ### Core
@@ -34,126 +32,24 @@ Available in **Python** (current, via [uv](https://docs.astral.sh/uv/)) and **Ru
 
 ## Quick Start
 
-### Python (uv)
-
-Install [uv](https://docs.astral.sh/uv/) if you don't have it:
-
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Run any server:
-
-```bash
-uv --directory /path/to/mcp-servers/mcp-sh run server.py --root /your/sandbox
-```
-
-### Rust (compiled binary)
-
-```bash
-# Clone and build all servers at once
 git clone https://github.com/your-org/mcp-servers
 cd mcp-servers
-git checkout feat/rust-port
 cargo build --release
-
-# Binaries land in target/release/
-./target/release/mcp-sh --root /your/sandbox
-./target/release/mcp-git --root /your/projects
 ```
 
-No Python, no venv, no uv — one binary per server.
+Binaries land in `target/release/`. Run any server:
+
+```bash
+./target/release/mcp-sh --root /your/sandbox
+```
 
 ## Configuration
 
-The config format is the same for Claude Desktop, LM Studio, and any other MCP-compatible client.
+The config format is the same for Claude Desktop, LM Studio, and any MCP-compatible client.
 
-### Claude Desktop
-
-`~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
-`%APPDATA%\Claude\claude_desktop_config.json` (Windows)
-
-### LM Studio
-
-Settings → MCP → Edit config file
-
----
-
-### Full example config (Python servers)
-
-```json
-{
-  "mcpServers": {
-    "mcp-sh": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-sh",
-        "run", "server.py",
-        "--root", "/your/sandbox",
-        "--timeout", "120",
-        "--max-output", "400000"
-      ]
-    },
-    "mcp-fs": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-fs",
-        "run", "server.py",
-        "--root", "/your/sandbox"
-      ]
-    },
-    "mcp-cc": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-cc",
-        "run", "server.py",
-        "--root", "/path/to/kv-data",
-        "--use-sqlite"
-      ]
-    },
-    "mcp-ws": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-ws",
-        "run", "server.py"
-      ]
-    },
-    "mcp-think": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-think",
-        "run", "server.py"
-      ]
-    },
-    "mcp-flow": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-flow",
-        "run", "server.py"
-      ]
-    },
-    "mcp-py": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-py",
-        "run", "server.py"
-      ]
-    },
-    "html-studio": {
-      "command": "uv",
-      "args": [
-        "--directory", "/path/to/mcp-servers/mcp-html-studio",
-        "run", "server.py",
-        "--root", "/your/html-projects"
-      ]
-    }
-  }
-}
-```
-
-### Full example config (Rust binaries)
-
-After `cargo build --release`:
+- **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **LM Studio** — Settings → MCP → Edit config file
 
 ```json
 {
@@ -208,7 +104,7 @@ After `cargo build --release`:
 
 ### Recommended ecosystem servers
 
-These are maintained by the MCP community and complement the servers above. They are downloaded automatically by `npx`/`uvx` on first run.
+Downloaded automatically on first run by `npx` / `uvx`.
 
 ```json
 {
@@ -252,7 +148,7 @@ These are maintained by the MCP community and complement the servers above. They
 | `--timeout` | `60` | Command timeout in seconds |
 | `--max-output` | `200000` | Max output characters before truncation |
 | `--deny-commands` | `rm,rmdir,dd,...` | Comma-separated commands to block |
-| `--allow-all` | off | Disable the deny list (unrestricted) |
+| `--allow-all` | off | Disable the deny list (allow all commands) |
 | `--isolation` | `auto` | OS write-confinement: `auto`, `write` (required), `off` |
 
 ### mcp-fs
@@ -268,17 +164,16 @@ These are maintained by the MCP community and complement the servers above. They
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--root` | `$PWD` | Directory for KV store files |
-| `--use-sqlite` | off | Use SQLite backend instead of flat files |
 | `--max-keys` | `10000` | Max keys per session |
 | `--ttl-cleanup` | `60` | TTL cleanup interval in seconds |
 
-### mcp-git *(Rust only)*
+### mcp-git
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--root` | `$PWD` | Restrict git operations to this directory tree |
 
-### mcp-db *(Rust only)*
+### mcp-db
 
 | Flag | Default | Description |
 |------|---------|-------------|
