@@ -40,6 +40,48 @@ struct Args {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox tool detection
+// ---------------------------------------------------------------------------
+
+/// Which OS-level sandbox wrapper is available.
+#[derive(Debug, Clone)]
+enum SandboxTool {
+    /// Linux: bubblewrap (bwrap) found at the given path.
+    #[allow(dead_code)]
+    Bwrap(PathBuf),
+    /// macOS: sandbox-exec is present at /usr/bin/sandbox-exec.
+    SandboxExec,
+    /// No OS sandbox available; fall back to deny-list only.
+    None,
+}
+
+/// Detect which sandboxing tool is available on this platform.
+fn detect_sandbox_tool() -> SandboxTool {
+    #[cfg(target_os = "macos")]
+    {
+        if std::path::Path::new("/usr/bin/sandbox-exec").exists() {
+            return SandboxTool::SandboxExec;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Try to find bwrap on PATH.
+        if let Ok(output) = std::process::Command::new("which").arg("bwrap").output() {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout);
+                let trimmed = path_str.trim();
+                if !trimmed.is_empty() {
+                    return SandboxTool::Bwrap(PathBuf::from(trimmed));
+                }
+            }
+        }
+    }
+
+    SandboxTool::None
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
@@ -49,17 +91,25 @@ struct SandboxState {
     denied: HashSet<String>,
     timeout_secs: u64,
     max_output: usize,
+    sandbox_tool: SandboxTool,
     /// session_id -> current working directory inside sandbox
     sessions: Arc<RwLock<HashMap<String, PathBuf>>>,
 }
 
 impl SandboxState {
-    fn new(root: PathBuf, denied: HashSet<String>, timeout_secs: u64, max_output: usize) -> Self {
+    fn new(
+        root: PathBuf,
+        denied: HashSet<String>,
+        timeout_secs: u64,
+        max_output: usize,
+        sandbox_tool: SandboxTool,
+    ) -> Self {
         Self {
             root,
             denied,
             timeout_secs,
             max_output,
+            sandbox_tool,
             sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -368,11 +418,24 @@ impl ShellServer {
             v.join(", ")
         };
 
+        let sandbox_info = match &self.state.sandbox_tool {
+            SandboxTool::Bwrap(path) => format!("bwrap ({})", path.display()),
+            SandboxTool::SandboxExec => "sandbox-exec (macOS)".to_string(),
+            SandboxTool::None => {
+                tracing::warn!(
+                    "No OS sandbox active — shell commands run without write confinement. \
+                     Install bubblewrap (bwrap) on Linux for OS-level sandboxing."
+                );
+                "none (WARNING: no write confinement; install bubblewrap on Linux)".to_string()
+            }
+        };
+
         format!(
             "Sandbox root: {root}\n\
              Timeout: {timeout}s\n\
              Max output: {max_output} chars\n\
              Denied commands: {denied}\n\
+             OS sandbox: {sandbox_info}\n\
              Active sessions:\n{sessions_info}\n\
              \n\
              Shell: /bin/bash (full feature set)\n\
@@ -408,18 +471,80 @@ async fn run_bash(
 
     tracing::debug!("Running bash command in {}: {}", cwd.display(), command);
 
-    let mut child = tokio::process::Command::new("/bin/bash")
-        .arg("-c")
-        .arg(&wrapped)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("PWD", cwd.to_string_lossy().as_ref())
-        // Keep temp files inside the sandbox; HOME is intentionally NOT overridden so
-        // that ~ expands to the real home directory, not the sandbox root.
-        .env("TMPDIR", state.root.join(".tmp").to_string_lossy().as_ref())
-        // Start in its own process group so we can kill the whole tree on timeout
-        .process_group(0)
-        .spawn()?;
+    let root_str = state.root.to_string_lossy();
+    let cwd_str = cwd.to_string_lossy();
+
+    let mut child = match &state.sandbox_tool {
+        SandboxTool::Bwrap(bwrap_path) => {
+            // bubblewrap: read-only bind of entire /, writable bind only for sandbox root and /tmp
+            let mut cmd = tokio::process::Command::new(bwrap_path);
+            cmd.args([
+                "--ro-bind", "/", "/",
+                "--dev", "/dev",
+                "--proc", "/proc",
+                "--bind", root_str.as_ref(), root_str.as_ref(),
+                "--tmpfs", "/tmp",
+                "--chdir", cwd_str.as_ref(),
+                "--die-with-parent",
+                "/bin/bash", "-c", &wrapped,
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .env("PWD", cwd_str.as_ref())
+            .env("TMPDIR", state.root.join(".tmp").to_string_lossy().as_ref());
+
+            #[cfg(unix)]
+            { cmd.process_group(0).kill_on_drop(true); }
+
+            cmd.spawn()?
+        }
+
+        SandboxTool::SandboxExec => {
+            // macOS sandbox-exec: allow everything by default, deny writes outside root and /tmp
+            let profile = format!(
+                "(version 1)\
+                 (allow default)\
+                 (deny file-write* (literal \"/\"))\
+                 (allow file-write* (subpath \"{root}\"))\
+                 (allow file-write* (subpath \"/tmp\"))\
+                 (allow file-write* (subpath \"/private/tmp\"))\
+                 (allow file-write* (literal \"/dev/null\"))",
+                root = root_str,
+            );
+
+            let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
+            cmd.args(["-p", &profile, "/bin/bash", "-c", &wrapped])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("PWD", cwd_str.as_ref())
+                .env("TMPDIR", state.root.join(".tmp").to_string_lossy().as_ref());
+
+            #[cfg(unix)]
+            { cmd.process_group(0).kill_on_drop(true); }
+
+            cmd.spawn()?
+        }
+
+        SandboxTool::None => {
+            tracing::warn!(
+                "No OS sandbox available (install bubblewrap on Linux). \
+                 Shell commands run without write confinement."
+            );
+
+            let mut cmd = tokio::process::Command::new("/bin/bash");
+            cmd.arg("-c")
+                .arg(&wrapped)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("PWD", cwd_str.as_ref())
+                .env("TMPDIR", state.root.join(".tmp").to_string_lossy().as_ref());
+
+            #[cfg(unix)]
+            { cmd.process_group(0).kill_on_drop(true); }
+
+            cmd.spawn()?
+        }
+    };
 
     // Collect stdout and stderr separately then merge
     let stdout = child.stdout.take().expect("stdout piped");
@@ -593,12 +718,23 @@ async fn main() -> Result<()> {
             .collect()
     };
 
+    // Detect OS sandbox tool once at startup.
+    let sandbox_tool = detect_sandbox_tool();
+    match &sandbox_tool {
+        SandboxTool::Bwrap(p) => tracing::info!("OS sandbox: bwrap at {}", p.display()),
+        SandboxTool::SandboxExec => tracing::info!("OS sandbox: sandbox-exec (macOS)"),
+        SandboxTool::None => tracing::warn!(
+            "No OS sandbox available (install bubblewrap on Linux). \
+             Shell commands run without write confinement."
+        ),
+    }
+
     tracing::info!("Sandbox root: {}", root.display());
     tracing::info!("Denied commands: {:?}", denied);
     tracing::info!("Timeout: {}s", args.timeout);
     tracing::info!("Max output: {} chars", args.max_output);
 
-    let state = SandboxState::new(root, denied, args.timeout, args.max_output);
+    let state = SandboxState::new(root, denied, args.timeout, args.max_output, sandbox_tool);
     let server = ShellServer { state };
 
     let service = server.serve(stdio()).await?;
@@ -726,6 +862,7 @@ mod tests {
             denied.iter().map(|s| s.to_string()).collect(),
             60,
             200_000,
+            SandboxTool::None,
         )
     }
 
@@ -831,7 +968,7 @@ mod tests {
         // Canonicalize so that macOS /var -> /private/var symlinks don't trip up
         // is_within_sandbox() when bash reports pwd via the canonical path.
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        SandboxState::new(root, HashSet::new(), 10, 200_000)
+        SandboxState::new(root, HashSet::new(), 10, 200_000, SandboxTool::None)
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use base64::Engine;
+use clap::Parser;
 use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue, USER_AGENT},
     redirect, Client,
@@ -15,6 +17,21 @@ const USER_AGENT_VALUE: &str = "mcp-http/0.1.0";
 const BODY_TRUNCATE: usize = 100_000;
 const TIMEOUT_SECS: u64 = 30;
 const MAX_REDIRECTS: usize = 10;
+const MAX_BINARY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
+// ── CLI args ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Debug)]
+#[command(name = "mcp-http", about = "HTTP client MCP server")]
+struct Args {
+    /// Allow requests to localhost and private IP ranges (SSRF risk — use only in trusted environments)
+    #[arg(long, default_value_t = false)]
+    allow_local: bool,
+
+    /// Directory to restrict http_download output paths to (recommended)
+    #[arg(long)]
+    download_dir: Option<PathBuf>,
+}
 
 // ── parameter structs ────────────────────────────────────────────────────────
 
@@ -74,10 +91,14 @@ struct HttpServer {
     client_follow: Client,
     /// Shared client that does NOT follow redirects.
     client_no_follow: Client,
+    /// Whether to allow requests to local/private addresses.
+    allow_local: bool,
+    /// Optional directory to restrict http_download output paths to.
+    download_dir: Option<PathBuf>,
 }
 
 impl HttpServer {
-    fn new() -> anyhow::Result<Self> {
+    fn new(allow_local: bool, download_dir: Option<PathBuf>) -> anyhow::Result<Self> {
         let client_follow = Client::builder()
             .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
             .redirect(redirect::Policy::limited(MAX_REDIRECTS))
@@ -95,8 +116,119 @@ impl HttpServer {
         Ok(Self {
             client_follow,
             client_no_follow,
+            allow_local,
+            download_dir,
         })
     }
+}
+
+// ── SSRF protection ───────────────────────────────────────────────────────────
+
+/// Returns an error string if the URL is blocked (private/loopback/metadata).
+fn check_ssrf(url: &str) -> Result<(), String> {
+    let parsed = url
+        .parse::<reqwest::Url>()
+        .map_err(|e| format!("Error: invalid URL: {e}"))?;
+
+    // Only allow http and https
+    match parsed.scheme() {
+        "http" | "https" => {}
+        s => return Err(format!("Error: scheme '{s}' is not allowed")),
+    }
+
+    let host = parsed.host_str().unwrap_or("").to_lowercase();
+
+    // Block metadata endpoints
+    if host == "169.254.169.254"
+        || host == "metadata.google.internal"
+        || host == "metadata.goog"
+    {
+        return Err(format!(
+            "Error: access to cloud metadata endpoint '{host}' is blocked"
+        ));
+    }
+
+    // Block loopback and link-local
+    if host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1" {
+        return Err(format!(
+            "Error: access to local address '{host}' is blocked. Use --allow-local to enable."
+        ));
+    }
+
+    // Block private IP ranges
+    if is_private_host(&host) {
+        return Err(format!(
+            "Error: access to private/local address '{host}' is blocked. Use --allow-local to enable."
+        ));
+    }
+
+    Ok(())
+}
+
+fn is_private_host(host: &str) -> bool {
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        return match addr {
+            std::net::IpAddr::V4(v4) => {
+                let octets = v4.octets();
+                octets[0] == 10
+                    || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+                    || (octets[0] == 192 && octets[1] == 168)
+                    || (octets[0] == 127)
+                    || (octets[0] == 169 && octets[1] == 254)
+                    || (octets[0] == 0)
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    || {
+                        let segs = v6.segments();
+                        segs[0] == 0xfc00
+                            || segs[0] == 0xfd00 // fc00::/7 ULA
+                            || segs[0] == 0xfe80 // link-local
+                    }
+            }
+        };
+    }
+    // Link-local domain names
+    host.ends_with(".local") || host.ends_with(".internal") || host.ends_with(".localhost")
+}
+
+// ── download path helper ──────────────────────────────────────────────────────
+
+fn resolve_download_path(
+    output_path: &str,
+    download_dir: Option<&std::path::Path>,
+) -> Result<PathBuf, String> {
+    let p = std::path::Path::new(output_path);
+    let candidate = if let Some(dir) = download_dir {
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        }
+    } else {
+        p.to_path_buf()
+    };
+    // Normalize (resolve . and ..)
+    let mut normalized = PathBuf::new();
+    for c in candidate.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other),
+        }
+    }
+    if let Some(dir) = download_dir {
+        if !normalized.starts_with(dir) {
+            return Err(format!(
+                "Error: download path '{}' is outside the allowed download directory",
+                output_path
+            ));
+        }
+    }
+    Ok(normalized)
 }
 
 // ── helper functions ─────────────────────────────────────────────────────────
@@ -132,10 +264,7 @@ fn parse_headers(raw: Option<String>) -> Result<HashMap<String, String>, String>
 fn build_header_map(extra: HashMap<String, String>) -> Result<HeaderMap, String> {
     let mut map = HeaderMap::new();
     // Always set a User-Agent (can be overridden by caller).
-    map.insert(
-        USER_AGENT,
-        HeaderValue::from_static(USER_AGENT_VALUE),
-    );
+    map.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_VALUE));
     for (k, v) in extra {
         let name = HeaderName::from_bytes(k.as_bytes())
             .map_err(|e| format!("Error: invalid header name '{k}': {e}"))?;
@@ -193,6 +322,12 @@ async fn format_response(resp: reqwest::Response) -> String {
         Err(e) => return format!("Error: failed to read response body: {e}"),
         Ok(bytes) => {
             if is_binary_content_type(&ct) {
+                if bytes.len() > MAX_BINARY_BYTES {
+                    return format!(
+                        "Error: binary response too large ({} bytes, max 10 MB). Use http_download to save to a file.",
+                        bytes.len()
+                    );
+                }
                 format!(
                     "[binary {} bytes, base64]\n{}",
                     bytes.len(),
@@ -213,9 +348,7 @@ async fn format_response(resp: reqwest::Response) -> String {
         }
     };
 
-    format!(
-        "Status: {status_line}\nHeaders: {headers_json}\n\n{body_text}"
-    )
+    format!("Status: {status_line}\nHeaders: {headers_json}\n\n{body_text}")
 }
 
 // ── tool implementations ─────────────────────────────────────────────────────
@@ -232,6 +365,11 @@ impl HttpServer {
         }): Parameters<GetParams>,
     ) -> String {
         tracing::info!(%url, follow_redirects, "http_get");
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
         let extra = match parse_headers(headers) {
             Ok(h) => h,
             Err(e) => return e,
@@ -266,7 +404,13 @@ impl HttpServer {
         }): Parameters<BodyParams>,
     ) -> String {
         tracing::info!(%url, "http_post");
-        self.send_with_body(reqwest::Method::POST, url, body, content_type, headers).await
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
+        self.send_with_body(reqwest::Method::POST, url, body, content_type, headers)
+            .await
     }
 
     #[tool(description = "Perform an HTTP PUT request with a body. content_type defaults to application/json. Returns status and response body.")]
@@ -280,7 +424,13 @@ impl HttpServer {
         }): Parameters<BodyParams>,
     ) -> String {
         tracing::info!(%url, "http_put");
-        self.send_with_body(reqwest::Method::PUT, url, body, content_type, headers).await
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
+        self.send_with_body(reqwest::Method::PUT, url, body, content_type, headers)
+            .await
     }
 
     #[tool(description = "Perform an HTTP PATCH request with a body. content_type defaults to application/json. Returns status and response body.")]
@@ -294,7 +444,13 @@ impl HttpServer {
         }): Parameters<BodyParams>,
     ) -> String {
         tracing::info!(%url, "http_patch");
-        self.send_with_body(reqwest::Method::PATCH, url, body, content_type, headers).await
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
+        self.send_with_body(reqwest::Method::PATCH, url, body, content_type, headers)
+            .await
     }
 
     #[tool(description = "Perform an HTTP DELETE request. Returns status and response body.")]
@@ -303,6 +459,11 @@ impl HttpServer {
         Parameters(NoBodyParams { url, headers }): Parameters<NoBodyParams>,
     ) -> String {
         tracing::info!(%url, "http_delete");
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
         let extra = match parse_headers(headers) {
             Ok(h) => h,
             Err(e) => return e,
@@ -330,6 +491,11 @@ impl HttpServer {
         Parameters(NoBodyParams { url, headers }): Parameters<NoBodyParams>,
     ) -> String {
         tracing::info!(%url, "http_head");
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
         let extra = match parse_headers(headers) {
             Ok(h) => h,
             Err(e) => return e,
@@ -363,6 +529,18 @@ impl HttpServer {
         use tokio::io::AsyncWriteExt;
 
         tracing::info!(%url, %output_path, "http_download");
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
+
+        let resolved_path =
+            match resolve_download_path(&output_path, self.download_dir.as_deref()) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+
         let resp = match self.client_follow.get(&url).send().await {
             Ok(r) => r,
             Err(e) => return format!("Error: {e}"),
@@ -378,15 +556,16 @@ impl HttpServer {
         }
 
         // Create parent directories if needed.
-        if let Some(parent) = std::path::Path::new(&output_path).parent() {
+        if let Some(parent) = resolved_path.parent() {
             if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return format!("Error: could not create parent directory: {e}");
             }
         }
 
-        let mut file = match tokio::fs::File::create(&output_path).await {
+        let resolved_str = resolved_path.display().to_string();
+        let mut file = match tokio::fs::File::create(&resolved_path).await {
             Ok(f) => f,
-            Err(e) => return format!("Error: could not create file '{output_path}': {e}"),
+            Err(e) => return format!("Error: could not create file '{resolved_str}': {e}"),
         };
 
         let bytes = match resp.bytes().await {
@@ -399,7 +578,7 @@ impl HttpServer {
             return format!("Error: failed to write file: {e}");
         }
 
-        format!("Downloaded {size} bytes to {output_path}")
+        format!("Downloaded {size} bytes to {resolved_str}")
     }
 
     #[tool(description = "Perform an HTTP POST with application/x-www-form-urlencoded encoding. fields_json is a JSON object of field names to values.")]
@@ -412,6 +591,11 @@ impl HttpServer {
         }): Parameters<FormPostParams>,
     ) -> String {
         tracing::info!(%url, "http_form_post");
+        if !self.allow_local {
+            if let Err(e) = check_ssrf(&url) {
+                return e;
+            }
+        }
         let extra = match parse_headers(headers) {
             Ok(h) => h,
             Err(e) => return e,
@@ -442,13 +626,7 @@ impl HttpServer {
         // URL-encode the form body.
         let encoded: String = form_fields
             .iter()
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    urlenccode(k),
-                    urlenccode(v)
-                )
-            })
+            .map(|(k, v)| format!("{}={}", urlenccode(k), urlenccode(v)))
             .collect::<Vec<_>>()
             .join("&");
 
@@ -493,8 +671,7 @@ impl HttpServer {
             Err(e) => return e,
         };
 
-        let ct = content_type
-            .unwrap_or_else(|| "application/json".to_string());
+        let ct = content_type.unwrap_or_else(|| "application/json".to_string());
         match HeaderValue::from_str(&ct) {
             Ok(v) => {
                 header_map.insert(reqwest::header::CONTENT_TYPE, v);
@@ -522,8 +699,9 @@ fn urlenccode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'*' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => {
+                out.push(b as char)
+            }
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -541,7 +719,8 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    let server = HttpServer::new()?;
+    let args = Args::parse();
+    let server = HttpServer::new(args.allow_local, args.download_dir)?;
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())

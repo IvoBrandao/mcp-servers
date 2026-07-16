@@ -1182,6 +1182,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "clap",
  "rmcp",
  "rusqlite",
  "schemars 0.8.22",
@@ -1235,6 +1236,7 @@ name = "mcp-git"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "rmcp",
  "schemars 0.8.22",
  "serde",
@@ -1270,6 +1272,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "clap",
  "reqwest",
  "rmcp",
  "schemars 0.8.22",

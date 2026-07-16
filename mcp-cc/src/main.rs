@@ -17,6 +17,13 @@ use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
+// Size limits
+// ---------------------------------------------------------------------------
+
+const MAX_KEY_BYTES: usize = 4 * 1024;        // 4 KB
+const MAX_VALUE_BYTES: usize = 1024 * 1024;   // 1 MB
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -201,6 +208,12 @@ impl KvServer {
     #[tool(description = "Store a key-value pair with optional TTL (seconds). \
         Overwrites any existing entry for that key in the session.")]
     fn kv_set(&self, Parameters(p): Parameters<KvSetParams>) -> String {
+        if p.key.len() > MAX_KEY_BYTES {
+            return format!("Error: key exceeds maximum size of {} bytes", MAX_KEY_BYTES);
+        }
+        if p.value.len() > MAX_VALUE_BYTES {
+            return format!("Error: value exceeds maximum size of {} MB", MAX_VALUE_BYTES / 1024 / 1024);
+        }
         let sid = resolve_session(p.session_id);
         let now = now_secs();
         let ttl_f: Option<f64> = p.ttl.map(|t| t as f64);
@@ -420,6 +433,11 @@ impl KvServer {
             session_id: Option<String>,
         }
 
+        const MAX_BATCH_JSON: usize = 10 * 1024 * 1024; // 10 MB
+        if p.items_json.len() > MAX_BATCH_JSON {
+            return format!("Error: items_json exceeds maximum size of 10 MB");
+        }
+
         let items: Vec<Item> = match serde_json::from_str(&p.items_json) {
             Ok(v) => v,
             Err(e) => return format!("Error: invalid JSON: {e}"),
@@ -431,6 +449,22 @@ impl KvServer {
         match self.db.lock() {
             Ok(conn) => {
                 for item in items {
+                    if item.key.len() > MAX_KEY_BYTES {
+                        results.push(serde_json::json!({
+                            "key": item.key,
+                            "status": "error",
+                            "error": format!("key exceeds maximum size of {} bytes", MAX_KEY_BYTES)
+                        }));
+                        continue;
+                    }
+                    if item.value.len() > MAX_VALUE_BYTES {
+                        results.push(serde_json::json!({
+                            "key": item.key,
+                            "status": "error",
+                            "error": format!("value exceeds maximum size of {} MB", MAX_VALUE_BYTES / 1024 / 1024)
+                        }));
+                        continue;
+                    }
                     let sid = resolve_session(item.session_id);
                     let ttl_f: Option<f64> = item.ttl.map(|t| t as f64);
 
@@ -614,10 +648,18 @@ impl KvServer {
 
         // Auto-detect gzip (magic bytes 0x1f 0x8b)
         let json: String = if raw.starts_with(&[0x1f, 0x8b]) {
+            const MAX_DECOMPRESSED: u64 = 50 * 1024 * 1024; // 50 MB
             let mut decoder = GzDecoder::new(raw.as_slice());
             let mut buf = String::new();
-            match decoder.read_to_string(&mut buf) {
-                Ok(_) => buf,
+            match std::io::Read::read_to_string(&mut (&mut decoder).take(MAX_DECOMPRESSED), &mut buf) {
+                Ok(_) => {
+                    // Check if there might be more data (we hit the limit)
+                    let mut probe = [0u8; 1];
+                    if std::io::Read::read(&mut decoder, &mut probe).unwrap_or(0) > 0 {
+                        return format!("Error: decompressed data exceeds {} MB limit", MAX_DECOMPRESSED / 1024 / 1024);
+                    }
+                    buf
+                }
                 Err(e) => return format!("Error: decompression failed: {e}"),
             }
         } else {

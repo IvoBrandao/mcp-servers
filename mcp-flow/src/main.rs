@@ -766,14 +766,15 @@ impl FlowServer {
             let mut stmt = conn.prepare(
                 "SELECT key, value, ttl FROM memories
                  WHERE session_id = ?1 AND (ttl IS NULL OR ttl > ?2)
-                 ORDER BY id DESC"
+                 ORDER BY id DESC
+                 LIMIT ?3"
             ).map_err(|e| format!("Error: {e}"))?;
 
             let query_lower = query.to_lowercase();
             let keywords: Vec<&str> = query_lower.split_whitespace().collect();
 
             let results: Vec<serde_json::Value> = stmt
-                .query_map(params![sid, ts], |row| {
+                .query_map(params![sid, ts, limit * 4], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -1053,7 +1054,8 @@ impl FlowServer {
 
             let mut stmt = conn.prepare(
                 "SELECT id, summary, from_ts, until_ts, created
-                 FROM long_term_memory WHERE session_id = ?1 ORDER BY id DESC"
+                 FROM long_term_memory WHERE session_id = ?1 ORDER BY id DESC
+                 LIMIT ?2"
             ).map_err(|e| format!("Error: {e}"))?;
 
             let filter = query
@@ -1062,7 +1064,7 @@ impl FlowServer {
                 .unwrap_or_default();
 
             let results: Vec<serde_json::Value> = stmt
-                .query_map(params![sid], |row| {
+                .query_map(params![sid, limit * 4], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,

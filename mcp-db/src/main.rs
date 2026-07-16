@@ -4,15 +4,29 @@
 // with "Error: …" so the LLM can report them gracefully without panicking.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use clap::Parser;
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use rmcp::{ServiceExt, transport::stdio};
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 use tracing::{info, warn};
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(name = "mcp-db", about = "SQLite database MCP server")]
+struct Args {
+    /// Restrict database files to this directory (created if needed). Omit to allow any path.
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
 
 // ---------------------------------------------------------------------------
 // Thread-safety shim
@@ -52,12 +66,14 @@ type ConnMap = Arc<RwLock<HashMap<String, Arc<Mutex<SendConn>>>>>;
 #[derive(Debug, Clone)]
 struct DbServer {
     connections: ConnMap,
+    root: Option<PathBuf>,
 }
 
 impl DbServer {
-    fn new() -> Self {
+    fn new(root: Option<PathBuf>) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
+            root,
         }
     }
 }
@@ -138,7 +154,8 @@ struct TransactionParams {
 
 /// Resolve `path` to an absolute, normalised key (no `..` or `.`).
 /// Does NOT require the path to exist, so it works for new databases.
-fn canonical_key(path: &str) -> Result<String, String> {
+/// If `root` is `Some`, the resolved path must be inside the root directory.
+fn resolve_db_path(path: &str, root: Option<&Path>) -> Result<String, String> {
     let p = std::path::Path::new(path);
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -157,13 +174,23 @@ fn canonical_key(path: &str) -> Result<String, String> {
             other => out.push(other),
         }
     }
+    if let Some(r) = root {
+        if !out.starts_with(r) {
+            return Err(format!(
+                "Error: path '{}' is outside the allowed root directory '{}'",
+                out.display(),
+                r.display()
+            ));
+        }
+    }
     Ok(out.to_string_lossy().into_owned())
 }
 
 /// Look up an open connection, returning an `Arc<Mutex<SendConn>>` or an
 /// error string.
 fn get_conn(map: &ConnMap, path: &str) -> Result<Arc<Mutex<SendConn>>, String> {
-    let key = canonical_key(path)?;
+    // Use no-root version here since root enforcement happens at open time.
+    let key = resolve_db_path(path, None)?;
     map.read()
         .map_err(|_| "Error: connection map RwLock poisoned".to_string())?
         .get(&key)
@@ -287,6 +314,22 @@ fn validate_ident(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Sanitize a CSV column header that fails validate_ident() into a safe identifier.
+fn sanitize_col_name(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, 'c');
+    }
+    if out.is_empty() {
+        "col".to_string()
+    } else {
+        out
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -301,7 +344,7 @@ impl DbServer {
         any other db_* tool for that file."
     )]
     fn db_open(&self, Parameters(OpenParams { path }): Parameters<OpenParams>) -> String {
-        let key = match canonical_key(&path) {
+        let key = match resolve_db_path(&path, self.root.as_deref()) {
             Ok(k) => k,
             Err(e) => return e,
         };
@@ -376,7 +419,7 @@ impl DbServer {
 
     #[tool(description = "Close a database connection. The file is not deleted.")]
     fn db_close(&self, Parameters(PathParams { path }): Parameters<PathParams>) -> String {
-        let key = match canonical_key(&path) {
+        let key = match resolve_db_path(&path, self.root.as_deref()) {
             Ok(k) => k,
             Err(e) => return e,
         };
@@ -659,8 +702,30 @@ impl DbServer {
             (hdrs, all_lines.as_slice())
         };
 
+        // Enforce row limit.
+        const MAX_CSV_ROWS: usize = 100_000;
+        if data_rows.len() > MAX_CSV_ROWS {
+            return format!(
+                "Error: CSV has {} data rows, maximum is {}",
+                data_rows.len(),
+                MAX_CSV_ROWS
+            );
+        }
+
+        // Sanitize column headers to prevent SQL injection.
+        let safe_headers: Vec<String> = headers
+            .iter()
+            .map(|h| {
+                if validate_ident(h).is_ok() {
+                    h.clone()
+                } else {
+                    sanitize_col_name(h)
+                }
+            })
+            .collect();
+
         // CREATE TABLE IF NOT EXISTS with TEXT columns.
-        let col_defs: String = headers
+        let col_defs: String = safe_headers
             .iter()
             .map(|h| format!("\"{h}\" TEXT"))
             .collect::<Vec<_>>()
@@ -670,7 +735,7 @@ impl DbServer {
             return format!("Error: cannot create table '{table}': {e}");
         }
 
-        let ph: String = headers
+        let ph: String = safe_headers
             .iter()
             .map(|_| "?")
             .collect::<Vec<_>>()
@@ -700,7 +765,7 @@ impl DbServer {
             "status":       "ok",
             "rows_imported": imported,
             "table":        table,
-            "columns":      headers
+            "columns":      safe_headers
         })
         .to_string()
     }
@@ -787,11 +852,11 @@ impl DbServer {
         &self,
         Parameters(BackupParams { path, backup_path }): Parameters<BackupParams>,
     ) -> String {
-        let src = match canonical_key(&path) {
+        let src = match resolve_db_path(&path, self.root.as_deref()) {
             Ok(k) => k,
             Err(e) => return e,
         };
-        let dst = match canonical_key(&backup_path) {
+        let dst = match resolve_db_path(&backup_path, self.root.as_deref()) {
             Ok(k) => k,
             Err(e) => return e,
         };
@@ -841,7 +906,7 @@ impl DbServer {
         };
         match conn.execute_batch("VACUUM;") {
             Ok(_) => {
-                let key = match canonical_key(&path) {
+                let key = match resolve_db_path(&path, self.root.as_deref()) {
                     Ok(k) => k,
                     Err(e) => return e,
                 };
@@ -923,7 +988,17 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(false)
         .init();
 
-    let service = DbServer::new().serve(stdio()).await?;
+    let args = Args::parse();
+
+    // Canonicalize root directory and create it if necessary.
+    let root = if let Some(r) = args.root {
+        std::fs::create_dir_all(&r)?;
+        Some(r.canonicalize()?)
+    } else {
+        None
+    };
+
+    let service = DbServer::new(root).serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

@@ -5,5 +5,8 @@ target
 *.cl*
 dist/
 .gitignore
-mcp-cc/data/*.db
+mcp-cc/data/
+mcp-think/data/
+mcp-flow/data/
+mcp-db/data/
 mcp_config.json

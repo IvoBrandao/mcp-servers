@@ -1,11 +1,27 @@
-use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use rmcp::{ServiceExt, transport::stdio};
 use serde::Deserialize;
+
+// ---------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(name = "mcp-git", about = "Git repository operations MCP server")]
+struct Args {
+    /// Restrict git operations to repositories within this directory. Omit to allow any path.
+    #[arg(long)]
+    root: Option<PathBuf>,
+
+    /// Allow git push operations (disabled by default to prevent accidental remote writes)
+    #[arg(long, default_value_t = false)]
+    allow_push: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Parameter structs
@@ -128,7 +144,10 @@ struct BlameParams {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-struct GitServer;
+struct GitServer {
+    root: Option<PathBuf>,
+    allow_push: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Helper: run a git command
@@ -193,17 +212,28 @@ async fn run_git(repo_path: &Path, args: &[&str]) -> String {
 }
 
 /// Resolve the repository path: use provided path or fall back to cwd.
-fn resolve_repo(repo_path: Option<String>) -> Result<PathBuf, String> {
-    match repo_path {
-        Some(p) => {
-            let path = PathBuf::from(&p);
-            if !path.exists() {
-                return Err(format!("Path does not exist: {p}"));
-            }
-            Ok(path)
-        }
-        None => env::current_dir().map_err(|e| format!("Cannot get current directory: {e}")),
+/// If root is provided, enforce that the resolved path is within it.
+fn resolve_repo(repo_path: Option<String>, root: Option<&Path>) -> Result<PathBuf, String> {
+    let path = match repo_path {
+        Some(p) => PathBuf::from(&p),
+        None => std::env::current_dir().map_err(|e| format!("Cannot get cwd: {e}"))?,
+    };
+    if !path.exists() {
+        return Err(format!("Path does not exist: {}", path.display()));
     }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("Cannot resolve path: {e}"))?;
+    if let Some(root) = root {
+        let canonical_root = std::fs::canonicalize(root)
+            .map_err(|e| format!("Cannot resolve root: {e}"))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(format!(
+                "Repository '{}' is outside the allowed root '{}'. Use --root to adjust.",
+                canonical.display(), canonical_root.display()
+            ));
+        }
+    }
+    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,7 +247,7 @@ impl GitServer {
         &self,
         Parameters(StatusParams { repo_path }): Parameters<StatusParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -244,7 +274,7 @@ impl GitServer {
         &self,
         Parameters(DiffParams { repo_path, staged, file }): Parameters<DiffParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -272,7 +302,7 @@ impl GitServer {
         &self,
         Parameters(LogParams { repo_path, limit, oneline }): Parameters<LogParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -294,7 +324,7 @@ impl GitServer {
         &self,
         Parameters(CommitParams { repo_path, message, add_all }): Parameters<CommitParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -319,7 +349,7 @@ impl GitServer {
         &self,
         Parameters(BranchListParams { repo_path }): Parameters<BranchListParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -332,7 +362,7 @@ impl GitServer {
         &self,
         Parameters(BranchCreateParams { repo_path, name, checkout }): Parameters<BranchCreateParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -353,7 +383,7 @@ impl GitServer {
         &self,
         Parameters(CheckoutParams { repo_path, branch_or_commit }): Parameters<CheckoutParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -370,7 +400,7 @@ impl GitServer {
         &self,
         Parameters(StashParams { repo_path, message }): Parameters<StashParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -387,7 +417,7 @@ impl GitServer {
         &self,
         Parameters(StashPopParams { repo_path }): Parameters<StashPopParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -400,7 +430,7 @@ impl GitServer {
         &self,
         Parameters(PullParams { repo_path, remote, branch }): Parameters<PullParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -425,7 +455,11 @@ impl GitServer {
         &self,
         Parameters(PushParams { repo_path, remote, branch, force }): Parameters<PushParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        if !self.allow_push {
+            return "Error: push is disabled. Start the server with --allow-push to enable git push.".to_string();
+        }
+
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -460,7 +494,7 @@ impl GitServer {
         &self,
         Parameters(ShowParams { repo_path, ref_ }): Parameters<ShowParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -474,7 +508,7 @@ impl GitServer {
         &self,
         Parameters(BlameParams { repo_path, file }): Parameters<BlameParams>,
     ) -> String {
-        let path = match resolve_repo(repo_path) {
+        let path = match resolve_repo(repo_path, self.root.as_deref()) {
             Ok(p) => p,
             Err(e) => return format!("Error: {e}"),
         };
@@ -501,7 +535,14 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting mcp-git server");
 
-    let service = GitServer.serve(stdio()).await?;
+    let args = Args::parse();
+
+    let service = GitServer {
+        root: args.root,
+        allow_push: args.allow_push,
+    }
+    .serve(stdio())
+    .await?;
     service.waiting().await?;
 
     Ok(())

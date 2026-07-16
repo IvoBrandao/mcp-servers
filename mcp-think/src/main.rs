@@ -10,8 +10,16 @@ use std::{
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn data_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".mcp-think")
+    // Prefer XDG_DATA_HOME if set, then HOME/.mcp-think, then current directory.
+    // Avoid /tmp which is world-readable on multi-user systems.
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("mcp-think");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".mcp-think");
+    }
+    // Fall back to current directory (not /tmp)
+    PathBuf::from(".mcp-think")
 }
 
 fn now_secs() -> f64 {
@@ -410,7 +418,10 @@ impl ThinkServer {
 impl ThinkServer {
     #[tool(description = "Add a reasoning step (thought/action/observation) to a session. Auto-creates the session if it does not exist. Returns the new step_id.")]
     async fn think_add_step(&self, Parameters(p): Parameters<AddStepParams>) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         ensure_session(&db, &p.session_id);
         let step_id = generate_id("step");
         let now = now_secs();
@@ -441,7 +452,10 @@ impl ThinkServer {
 
     #[tool(description = "Get the ordered reasoning chain for a session as a JSON array of steps.")]
     async fn think_get_chain(&self, Parameters(p): Parameters<GetChainParams>) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         let limit = p.limit.unwrap_or(100);
         let mut stmt = match db.prepare(
             "SELECT step_id, parent_step_id, step_type, content, confidence,
@@ -480,7 +494,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<EvaluateStepParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         match db.execute(
             "UPDATE reasoning_steps
              SET evaluation_score=?1, evaluation_note=?2
@@ -503,7 +520,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<AddAssumptionParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         ensure_session(&db, &p.session_id);
         let assumption_id = generate_id("assumption");
         let now = now_secs();
@@ -530,7 +550,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<SessionParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         let mut stmt = match db.prepare(
             "SELECT assumption_id, content, confidence, evidence, created
              FROM assumptions WHERE session_id=?1 ORDER BY created ASC",
@@ -561,7 +584,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<CheckContradictionParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
 
         // Collect step contents
         let mut candidates: Vec<(String, String)> = Vec::new();
@@ -622,7 +648,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<ResolveContradictionParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         match db.execute(
             "UPDATE contradictions SET resolved=1 WHERE id=?1 AND session_id=?2",
             rusqlite::params![p.contradiction_id, p.session_id],
@@ -664,7 +693,10 @@ impl ThinkServer {
             None => return "Error: pattern has no steps".to_string(),
         };
 
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         ensure_session(&db, &p.session_id);
 
         let mut created_ids: Vec<String> = Vec::new();
@@ -694,7 +726,10 @@ impl ThinkServer {
 
     #[tool(description = "Save a named checkpoint of the current session state (all steps, assumptions, and contradictions) as a JSON snapshot in the database.")]
     async fn think_save_checkpoint(&self, Parameters(p): Parameters<CheckpointParams>) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
         let snapshot = CheckpointSnapshot {
             steps: load_steps(&db, &p.session_id),
             assumptions: load_assumptions(&db, &p.session_id),
@@ -727,7 +762,10 @@ impl ThinkServer {
         &self,
         Parameters(p): Parameters<CheckpointParams>,
     ) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
 
         let json: Option<String> = db
             .query_row(
@@ -847,7 +885,10 @@ impl ThinkServer {
 
     #[tool(description = "Get a summary of a session: total steps, average confidence, assumption count, total and unresolved contradiction counts.")]
     async fn think_session_summary(&self, Parameters(p): Parameters<SessionParams>) -> String {
-        let db = self.db.lock().unwrap();
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return "Error: database lock is poisoned (a previous operation panicked). Restart the server.".to_string(),
+        };
 
         let total_steps: i64 = db
             .query_row(
