@@ -413,9 +413,9 @@ async fn run_bash(
         .arg(&wrapped)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .env("HOME", state.root.to_string_lossy().as_ref())
         .env("PWD", cwd.to_string_lossy().as_ref())
-        // Keep temp files inside the sandbox
+        // Keep temp files inside the sandbox; HOME is intentionally NOT overridden so
+        // that ~ expands to the real home directory, not the sandbox root.
         .env("TMPDIR", state.root.join(".tmp").to_string_lossy().as_ref())
         // Start in its own process group so we can kill the whole tree on timeout
         .process_group(0)
@@ -605,4 +605,338 @@ async fn main() -> Result<()> {
     service.waiting().await?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    // --- normalize_path ---
+
+    #[test]
+    fn normalize_removes_dot() {
+        let p = PathBuf::from("/a/./b");
+        assert_eq!(normalize_path(&p), PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn normalize_resolves_parent() {
+        let p = PathBuf::from("/a/b/../c");
+        assert_eq!(normalize_path(&p), PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalize_handles_double_parent() {
+        let p = PathBuf::from("/a/b/c/../../d");
+        assert_eq!(normalize_path(&p), PathBuf::from("/a/d"));
+    }
+
+    #[test]
+    fn normalize_already_clean() {
+        let p = PathBuf::from("/a/b/c");
+        assert_eq!(normalize_path(&p), PathBuf::from("/a/b/c"));
+    }
+
+    // --- shell_quote ---
+
+    #[test]
+    fn shell_quote_simple() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_quote_with_spaces() {
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn shell_quote_with_single_quote() {
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_path() {
+        assert_eq!(shell_quote("/home/user/my dir"), "'/home/user/my dir'");
+    }
+
+    // --- first_word ---
+
+    #[test]
+    fn first_word_simple() {
+        assert_eq!(first_word("ls -la"), "ls");
+    }
+
+    #[test]
+    fn first_word_leading_whitespace() {
+        assert_eq!(first_word("  rm -rf /"), "rm");
+    }
+
+    #[test]
+    fn first_word_empty() {
+        assert_eq!(first_word(""), "");
+    }
+
+    #[test]
+    fn first_word_only_spaces() {
+        assert_eq!(first_word("   "), "");
+    }
+
+    // --- extract_cwd_sentinel ---
+
+    #[test]
+    fn sentinel_extracts_cwd() {
+        let s = "hello world\n__MCP_CWD__:/some/path\n";
+        let (out, cwd) = extract_cwd_sentinel(s, "__MCP_CWD__:");
+        assert_eq!(out, "hello world");
+        assert_eq!(cwd, Some("/some/path"));
+    }
+
+    #[test]
+    fn sentinel_no_sentinel_returns_full_string() {
+        let s = "hello world\n";
+        let (out, cwd) = extract_cwd_sentinel(s, "__MCP_CWD__:");
+        assert_eq!(out, "hello world\n");
+        assert_eq!(cwd, None);
+    }
+
+    #[test]
+    fn sentinel_uses_last_occurrence() {
+        let s = "output\n__MCP_CWD__:/first\nmore output\n__MCP_CWD__:/second\n";
+        let (_, cwd) = extract_cwd_sentinel(s, "__MCP_CWD__:");
+        assert_eq!(cwd, Some("/second"));
+    }
+
+    #[test]
+    fn sentinel_empty_cwd_treated_as_none() {
+        let s = "output\n__MCP_CWD__:\n";
+        let (_, cwd) = extract_cwd_sentinel(s, "__MCP_CWD__:");
+        assert_eq!(cwd, None);
+    }
+
+    // --- SandboxState::find_denied ---
+
+    fn make_state(root: &str, denied: &[&str]) -> SandboxState {
+        SandboxState::new(
+            PathBuf::from(root),
+            denied.iter().map(|s| s.to_string()).collect(),
+            60,
+            200_000,
+        )
+    }
+
+    #[test]
+    fn find_denied_simple_match() {
+        let s = make_state("/sandbox", &["rm", "sudo"]);
+        assert_eq!(s.find_denied("rm -rf /"), Some("rm".to_string()));
+    }
+
+    #[test]
+    fn find_denied_no_match() {
+        let s = make_state("/sandbox", &["rm", "sudo"]);
+        assert_eq!(s.find_denied("ls -la"), None);
+    }
+
+    #[test]
+    fn find_denied_in_pipeline() {
+        let s = make_state("/sandbox", &["sudo"]);
+        assert_eq!(s.find_denied("echo hello | sudo tee /etc/hosts"), Some("sudo".to_string()));
+    }
+
+    #[test]
+    fn find_denied_semicolon_separated() {
+        let s = make_state("/sandbox", &["shutdown"]);
+        assert_eq!(s.find_denied("echo hi; shutdown -h now"), Some("shutdown".to_string()));
+    }
+
+    #[test]
+    fn find_denied_word_boundary() {
+        // "removal" should not match the "rm" deny entry
+        let s = make_state("/sandbox", &["rm"]);
+        assert_eq!(s.find_denied("removal --help"), None);
+    }
+
+    #[test]
+    fn find_denied_empty_list() {
+        let s = make_state("/sandbox", &[]);
+        assert_eq!(s.find_denied("rm -rf /"), None);
+    }
+
+    // --- SandboxState::is_within_sandbox ---
+
+    #[test]
+    fn within_sandbox_exact_root() {
+        let s = make_state("/sandbox", &[]);
+        assert!(s.is_within_sandbox(Path::new("/sandbox")));
+    }
+
+    #[test]
+    fn within_sandbox_subdir() {
+        let s = make_state("/sandbox", &[]);
+        assert!(s.is_within_sandbox(Path::new("/sandbox/sub/dir")));
+    }
+
+    #[test]
+    fn outside_sandbox() {
+        let s = make_state("/sandbox", &[]);
+        assert!(!s.is_within_sandbox(Path::new("/etc")));
+    }
+
+    #[test]
+    fn sandbox_traversal_attempt() {
+        let s = make_state("/sandbox", &[]);
+        // A normalised path — raw `..` doesn't bypass starts_with
+        let traversal = normalize_path(Path::new("/sandbox/../etc/passwd"));
+        assert!(!s.is_within_sandbox(&traversal));
+    }
+
+    // --- SandboxState::resolve_path ---
+
+    #[tokio::test]
+    async fn resolve_path_absolute_inside_sandbox() {
+        let s = make_state("/sandbox", &[]);
+        let r = s.resolve_path("/sandbox/foo/bar", None).await;
+        assert_eq!(r.unwrap(), PathBuf::from("/sandbox/foo/bar"));
+    }
+
+    #[tokio::test]
+    async fn resolve_path_relative_to_root() {
+        let s = make_state("/sandbox", &[]);
+        let r = s.resolve_path("foo/bar", None).await;
+        assert_eq!(r.unwrap(), PathBuf::from("/sandbox/foo/bar"));
+    }
+
+    #[tokio::test]
+    async fn resolve_path_outside_sandbox_rejected() {
+        let s = make_state("/sandbox", &[]);
+        let r = s.resolve_path("/etc/passwd", None).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("outside the sandbox"));
+    }
+
+    #[tokio::test]
+    async fn resolve_path_traversal_rejected() {
+        let s = make_state("/sandbox", &[]);
+        let r = s.resolve_path("../../etc/passwd", None).await;
+        assert!(r.is_err());
+    }
+
+    // --- Integration: run_bash ---
+
+    fn sandbox_state(root: &Path) -> SandboxState {
+        // Canonicalize so that macOS /var -> /private/var symlinks don't trip up
+        // is_within_sandbox() when bash reports pwd via the canonical path.
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        SandboxState::new(root, HashSet::new(), 10, 200_000)
+    }
+
+    #[tokio::test]
+    async fn run_bash_simple_echo() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+        let out = run_bash("echo hello", dir.path(), None, &state).await.unwrap();
+        assert_eq!(out.trim(), "hello");
+    }
+
+    #[tokio::test]
+    async fn run_bash_tilde_expands_to_real_home() {
+        // ~ must expand to the actual home directory, not the sandbox root.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        let real_home = std::env::var("HOME").expect("HOME must be set");
+        let out = run_bash("echo ~", dir.path(), None, &state).await.unwrap();
+        assert_eq!(
+            out.trim(),
+            real_home,
+            "~ should expand to real HOME, not sandbox root"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_tilde_path_not_doubled() {
+        // Regression: ls ~/subdir must not produce double path segments.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        let real_home = std::env::var("HOME").expect("HOME must be set");
+        let out = run_bash("echo ~/nonexistent_dir", dir.path(), None, &state)
+            .await
+            .unwrap();
+        let expected = format!("{}/nonexistent_dir", real_home);
+        assert_eq!(
+            out.trim(),
+            expected,
+            "~/subdir must expand without doubling the home path"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bash_pwd_reflects_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        let out = run_bash("pwd -P", dir.path(), None, &state).await.unwrap();
+        // canonicalize the tmpdir path for comparison (macOS /var -> /private/var)
+        let canonical = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(out.trim(), canonical.to_string_lossy().as_ref());
+    }
+
+    #[tokio::test]
+    async fn run_bash_exit_code_non_zero_still_returns_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        let out = run_bash("echo err >&2; exit 1", dir.path(), None, &state)
+            .await
+            .unwrap();
+        assert!(out.contains("err"), "stderr should appear in output");
+    }
+
+    #[tokio::test]
+    async fn run_bash_empty_output_returns_no_output_string() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        let out = run_bash("true", dir.path(), None, &state).await.unwrap();
+        assert_eq!(out, "(no output)");
+    }
+
+    #[tokio::test]
+    async fn run_bash_timeout_returns_timeout_message() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let mut state = sandbox_state(dir.path());
+        state.timeout_secs = 1;
+
+        let out = run_bash("sleep 10", dir.path(), None, &state).await.unwrap();
+        assert!(out.contains("Timed out"), "should report timeout");
+    }
+
+    #[tokio::test]
+    async fn run_bash_session_tracks_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("sub");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let state = sandbox_state(dir.path());
+
+        // cd into sub/
+        run_bash("cd sub", dir.path(), Some("s1"), &state).await.unwrap();
+
+        // Next call should start in sub/
+        let cwd = state.session_cwd(Some("s1")).await;
+        let canonical_sub = std::fs::canonicalize(&subdir).unwrap();
+        assert_eq!(cwd, canonical_sub, "session cwd should have updated after cd");
+    }
 }

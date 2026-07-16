@@ -16,3 +16,6 @@ schemars = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true }
 regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
